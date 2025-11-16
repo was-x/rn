@@ -19,7 +19,6 @@ RUN mkdir -p dist/apps/node-vless && \
 const http = require('http');
 const WebSocket = require('ws');
 const net = require('net');
-const crypto = require('crypto');
 
 const PORT = process.env.PORT || 10000;
 const UUID = process.env.UUID || 'ce6d9073-7085-4cb1-a64d-382489a2af94';
@@ -27,106 +26,93 @@ const UUID = process.env.UUID || 'ce6d9073-7085-4cb1-a64d-382489a2af94';
 console.log(`Starting V2ray Edge VLESS Server on port ${PORT}`);
 console.log(`UUID: ${UUID}`);
 
-// VLESS protocol constants
-const VLESS_VERSION = 0x01;
-const VLESS_COMMAND_TCP = 0x01;
-const VLESS_COMMAND_UDP = 0x02;
-const VLESS_OPTION_CHUNK_MASK = 0x04;
-
-function isValidUUID(uuid) {
-  const regex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  return regex.test(uuid);
+// Convert UUID string to buffer
+function uuidToBuffer(uuid) {
+  const hex = uuid.replace(/-/g, '');
+  return Buffer.from(hex, 'hex');
 }
 
-function handleVLESSConnection(ws, data) {
-  try {
-    // Basic VLESS header parsing (simplified)
-    if (data.length < 16) {
-      console.log('Invalid VLESS header length');
-      return false;
-    }
-
-    // Check UUID (first 16 bytes)
-    const receivedUUID = data.slice(0, 16).toString('hex');
-    const expectedUUID = UUID.replace(/-/g, '');
-    
-    if (receivedUUID !== expectedUUID) {
-      console.log('UUID mismatch');
-      return false;
-    }
-
-    console.log('VLESS handshake successful');
-    
-    // Send response indicating successful connection
-    const response = Buffer.from([VLESS_VERSION, 0x00]); // Version + Addon length
-    ws.send(response);
-    
-    return true;
-  } catch (error) {
-    console.log('VLESS protocol error:', error.message);
-    return false;
-  }
-}
+const expectedUUIDBuffer = uuidToBuffer(UUID);
 
 const server = http.createServer((req, res) => {
   if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('V2ray Edge VLESS Server is running\\nUUID: ' + UUID);
+  } else if (req.url === `/${UUID}`) {
+    res.writeHead(200);
+    res.end('VLESS endpoint ready');
   } else {
     res.writeHead(404);
     res.end('Not found');
   }
 });
 
-const wss = new WebSocket.Server({ 
-  server,
-  verifyClient: (info) => {
-    // Verify the path contains the correct UUID
-    const url = new URL(info.req.url, `http://${info.req.headers.host}`);
-    return url.pathname === `/${UUID}` || url.pathname === `/`;
-  }
-});
+const wss = new WebSocket.Server({ server });
 
 wss.on('connection', (ws, req) => {
-  console.log('WebSocket connection established');
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  console.log('WebSocket connection established for path:', url.pathname);
+  
+  // Set binary type to handle VLESS protocol
+  ws.binaryType = 'arraybuffer';
   
   ws.on('message', (data) => {
-    if (Buffer.isBuffer(data)) {
-      console.log(`Received VLESS data: ${data.length} bytes`);
+    try {
+      // Convert to Buffer regardless of input type
+      const buffer = Buffer.from(data);
+      console.log(`Received data: ${buffer.length} bytes`);
       
-      // Handle VLESS protocol
-      if (handleVLESSConnection(ws, data)) {
-        // Keep connection alive for actual traffic
-        console.log('VLESS protocol established, keeping connection open');
+      // Check if this is a VLESS handshake (minimum 16 bytes for UUID)
+      if (buffer.length >= 16) {
+        const receivedUUID = buffer.slice(0, 16);
         
-        // Handle subsequent data packets (simplified)
-        ws.on('message', (trafficData) => {
-          console.log(`Traffic data: ${trafficData.length} bytes`);
-          // Echo back for testing (in real implementation, this would route traffic)
-          ws.send(trafficData);
-        });
+        // Compare UUIDs
+        if (receivedUUID.equals(expectedUUIDBuffer)) {
+          console.log('✅ VLESS UUID verification successful');
+          
+          // Send VLESS response (version + addon length)
+          const response = Buffer.from([0x01, 0x00]); // Version 1, 0 addons
+          ws.send(response);
+          console.log('✅ Sent VLESS handshake response');
+          
+          // Now handle actual VLESS traffic
+          ws.on('message', (trafficData) => {
+            const trafficBuffer = Buffer.from(trafficData);
+            console.log(`📦 Traffic data: ${trafficBuffer.length} bytes`);
+            
+            // Echo back for testing (in real implementation, route this traffic)
+            ws.send(trafficBuffer);
+          });
+          
+        } else {
+          console.log('❌ UUID mismatch');
+          console.log('Expected:', UUID);
+          console.log('Received:', receivedUUID.toString('hex'));
+          ws.close(1008, 'UUID authentication failed');
+        }
       } else {
-        console.log('VLESS handshake failed, closing connection');
-        ws.close();
+        console.log('❌ Invalid VLESS header length:', buffer.length);
+        ws.close(1008, 'Invalid VLESS header');
       }
-    } else {
-      console.log('Received non-buffer data, closing connection');
-      ws.close();
+    } catch (error) {
+      console.log('❌ Error processing message:', error.message);
+      ws.close(1011, 'Internal error');
     }
   });
 
   ws.on('close', (code, reason) => {
-    console.log(`WebSocket disconnected: ${code} - ${reason}`);
+    console.log(`🔌 WebSocket disconnected: ${code} - ${reason}`);
   });
 
   ws.on('error', (error) => {
-    console.log('WebSocket error:', error.message);
+    console.log('❌ WebSocket error:', error.message);
   });
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`VLESS Server listening on 0.0.0.0:${PORT}`);
-  console.log(`WebSocket endpoint: ws://0.0.0.0:${PORT}/${UUID}`);
+  console.log(`✅ VLESS Server listening on 0.0.0.0:${PORT}`);
+  console.log(`🔗 WebSocket endpoint: wss://darkk-tunnell.onrender.com/${UUID}`);
+  console.log(`🔑 Using UUID: ${UUID}`);
 });
 
 // Graceful shutdown
@@ -155,7 +141,6 @@ RUN npm install
 # Set environment variables
 ENV PORT=10000
 ENV UUID=ce6d9073-7085-4cb1-a64d-382489a2af94
-ENV SMALLRAM=false
 
 EXPOSE 10000
 
